@@ -1,0 +1,209 @@
+import os
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Environmental Configuration
+env_path = Path(__file__).parent / "API_Keys.env"
+load_dotenv(env_path)
+
+from google import genai
+from google.genai import types
+import anthropic
+
+# Models & Clients
+GEMINI_MODEL = "gemini-2.5-flash"
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+if not os.getenv("GEMINI_API_KEY") or not os.getenv("ANTHROPIC_API_KEY"):
+    raise ValueError("Missing API Keys in API_Keys.env file.")
+
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Your existing system voice rules
+SHARED_VOICE_AND_VERIFICATION = (
+    "VOICE RULES: NEVER use hedges, preambles, or generic openers. "
+    "ALWAYS lead with the insight, use short declarative sentences, and state settled facts as facts. "
+    "STRUCTURE: X posts under 280 chars unless a thread. Rewrite per room across platforms."
+)
+
+# =====================================================================
+# MODULE 1: ANALYTICS & FEEDBACK LOOP
+# =====================================================================
+class AnalyticsEngine:
+    """Simulates or fetches recent X/Social performance metrics to create a feedback loop."""
+    @staticmethod
+    def get_recent_performance_data() -> dict:
+        # In production, replace this with actual tweepy / X API v2 payload data
+        print("📊 Extracting recent X content analytics...")
+        mock_analytics_data = {
+            "top_performing_hook_style": "Contrarian technical breakdown with real numbers",
+            "underperforming_style": "Generic high-level motivational or lifestyle posts",
+            "audience_resonance_topics": ["Workflow automation", "CPA to entrepreneur transition strategies"],
+            "average_engagement_rate_last_week": "4.8%"
+        }
+        return mock_analytics_data
+
+# =====================================================================
+# MODULE 2: STRATEGY & STORYBOARD ENGINE
+# =====================================================================
+class StrategyEngine:
+    """Establishes the macro strategy and cohesive storyboards across content pillars."""
+    @staticmethod
+    def generate_weekly_storyboard(monthly_theme: str, active_pillar: str, performance_data: dict) -> str:
+        print(f"🎯 Creating a cohesive weekly storyboard for Pillar: {active_pillar}...")
+        
+        prompt = f"""
+        Act as a Master Social Media Strategist. Define a cohesive 5-day story arc (throughline) for this week.
+        
+        MONTHLY THEME: {monthly_theme}
+        ACTIVE PILLAR: {active_pillar}
+        RECENT PERFORMANCE DATA TO ADAPT TO: {performance_data}
+        
+        OUTPUT FORMAT:
+        - WEEKLY THROUGHLINE: (One sentence narrative arc connecting all posts this week)
+        - DAY 1 (The Hook/Problem): Concept overview
+        - DAY 2 (The Data/Evidence): Deep-dive breakdown
+        - DAY 3 (The Solution/Framework): Practical execution
+        - DAY 4 (The Contrarian Take): Challenging the status quo
+        - DAY 5 (The Actionable Summary): High-impact wrap up and clear CTA
+        """
+        
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.4)
+        )
+        return response.text
+
+# =====================================================================
+# MODULE 3: TRANSFERABLE RESEARCH ENGINE
+# =====================================================================
+class ResearchEngine:
+    """Generates clean, transferable research inputs mapping directly to the narrative arc."""
+    @staticmethod
+    def generate_research_brief(topic: str, weekly_storyboard: str) -> str:
+        print("📚 Executing deep research briefing via Claude...")
+        
+        prompt = f"""
+        You are a specialized content researcher. Prepare a highly transferable research briefing on: {topic}
+        It must seamlessly feed into this planned weekly narrative arc:
+        {weekly_storyboard}
+
+        Provide structural research items formatted EXACTLY below:
+        1. Core Data Points & Verifiable Numbers (Anonymized case studies, dates, real metrics)
+        2. Underlying Technical Mechanics (How it works fundamentally)
+        3. Clear Human-Interest Hooks (Why a professional or creative stops scrolling)
+        4. Risks, Pitfalls, & Hidden Realities
+        5. The Strategic Counterpoint (What everyone gets wrong about this topic)
+        """
+        
+        message = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=3000,
+            temperature=0.3,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text
+
+# =====================================================================
+# MODULE 4: COLLABORATIVE PRODUCTION & EDITING ENGINE
+# =====================================================================
+class ProductionEngine:
+    """Manages multi-LLM copywriting, image prompting, and collaborative editing."""
+    @staticmethod
+    def generate_initial_draft(research_brief: str, storyboard: str) -> str:
+        print("🤖 Crafting initial content drafts (Gemini)...")
+        prompt = f"""
+        Using this STORYBOARD:
+        {storyboard}
+        
+        And this RESEARCH BRIEF:
+        {research_brief}
+        
+        Generate a complete 5-day social media plan. Follow this exact template for EACH day:
+        ---
+        [DAY]:
+        [NARRATIVE PURPOSE]:
+        [DRAFT COPY]: (Under 280 characters for X)
+        ---
+        Apply these rules: {SHARED_VOICE_AND_VERIFICATION}
+        """
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.5)
+        )
+        return response.text
+
+    @staticmethod
+    def collaborative_edit_loop(initial_draft: str) -> str:
+        print("🪶 Running editor loop (Claude Reviewing Gemini Draft)...")
+        
+        editing_prompt = f"""
+        Review and ruthlessly polish the following initial social media draft. 
+        You must enforce these constraints flawlessly:
+        {SHARED_VOICE_AND_VERIFICATION}
+
+        INITIAL DRAFT:
+        {initial_draft}
+
+        Provide the finalized, edited version of the 5-day plan. Ensure no preambles remain. Keep characters under hard limits.
+        """
+        message = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            temperature=0.2,
+            messages=[{"role": "user", "content": editing_prompt}],
+        )
+        return message.content[0].text
+
+    @staticmethod
+    def generate_graphic_prompts(final_copy: str) -> str:
+        print("🎨 Generating asset visual direction and graphic design prompts...")
+        prompt = f"""
+        Based on the following approved social copy, generate text-to-image prompts or text-overlay templates for standard graphic design software (Midjourney/Canva/DALL-E).
+        Provide a visual prompt/direction for each day that matches a clean, premium brand aesthetic for Black professionals and creatives.
+
+        APPROVED COPY:
+        {final_copy}
+        """
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.4)
+        )
+        return response.text
+
+# =====================================================================
+# EXECUTION WORKFLOW
+# =====================================================================
+if __name__ == "__main__":
+    # High-level Strategic Anchors
+    MONTHLY_THEME = "Scaling Digital Asset Operations for Micro-Consultancies"
+    TARGET_PILLAR = "Integrating Technology into Workflows"
+    
+    print(f"🚀 STARTING ENTERPRISE WORKFLOW FOR: '{MONTHLY_THEME}'")
+    
+    # 1. Analytics & Feedback Loop
+    analytics = AnalyticsEngine.get_recent_performance_data()
+    
+    # 2. Strategy & Storyboard Development
+    weekly_storyboard = StrategyEngine.generate_weekly_storyboard(MONTHLY_THEME, TARGET_PILLAR, analytics)
+    print("\n🗺️ WEEKLY STORYBOARD MAP:\n", weekly_storyboard)
+    
+    # 3. Transferable Research Collection
+    research_brief = ResearchEngine.generate_research_brief(TARGET_PILLAR, weekly_storyboard)
+    
+    # 4. Content Production & Multi-LLM Review Loop
+    raw_draft = ProductionEngine.generate_initial_draft(research_brief, weekly_storyboard)
+    final_edited_copy = ProductionEngine.collaborative_edit_loop(raw_draft)
+    
+    print("\n✨ FINAL COPY FOR YOUR APPROVAL:\n", final_edited_copy)
+    
+    # 5. Asset Prompt Production (Graphic/Image Engine)
+    design_brief = ProductionEngine.generate_graphic_prompts(final_edited_copy)
+    print("\n🎨 COMPANION VISUAL DESIGN PROMPTS:\n", design_brief)
+    
+    print("\n🎬 Production pipeline complete. Ready for manual staging and filming.")
