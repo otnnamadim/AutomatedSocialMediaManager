@@ -1,91 +1,369 @@
 import os
+import pandas as pd
 import time
+import json
+import statistics
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Environmental Configuration
 env_path = Path(__file__).parent / "API_Keys.env"
-load_dotenv(env_path)
+load_dotenv(env_path, override=True)
+openai_key = os.getenv("OPENAI_API_KEY")
+anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+print(f"OpenAI key loaded: {openai_key[:6]}...{openai_key[-4:]} (length {len(openai_key)})" if openai_key else "OpenAI key: NOT FOUND")
+print(f"Anthropic key loaded: {anthropic_key[:8]}...{anthropic_key[-4:]} (length {len(anthropic_key)})" if anthropic_key else "Anthropic key: NOT FOUND")
 
-from google import genai
-from google.genai import types
+for var in ["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"]:
+    val = os.getenv(var)
+    if val:
+        print(f"{var}: {val[:6]}...{val[-4:]} (length {len(val)})")
+    else:
+        print(f"{var}: NOT FOUND")
+
+from openai import OpenAI, APIStatusError, RateLimitError
 import anthropic
 
 # Models & Clients
-GEMINI_MODEL = "gemini-2.5-flash"
-CLAUDE_MODEL = "claude-sonnet-4-6"
+# NOTE: switched from Gemini to OpenAI after hitting a 429 RESOURCE_EXHAUSTED
+# quota error on the Google account. GPT-5.5 is OpenAI's current flagship;
+# GPT-5.4 / GPT-5.4 mini are cheaper, still-capable fallbacks if you hit a
+# rate limit or outage on the primary model.
+OPENAI_MODEL = "gpt-5.5"
+OPENAI_FALLBACK_MODELS = ["gpt-5.4", "gpt-5.4-mini"]
+CLAUDE_MODEL = "claude-sonnet-5"
 
-if not os.getenv("GEMINI_API_KEY") or not os.getenv("ANTHROPIC_API_KEY"):
+if not os.getenv("OPENAI_API_KEY") or not os.getenv("ANTHROPIC_API_KEY"):
     raise ValueError("Missing API Keys in API_Keys.env file.")
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+
+def openai_generate_with_fallback(prompt: str) -> str:
+    """Try OPENAI_MODEL first; on a rate-limit/quota (429) or server (5xx)
+    error, fall through to each model in OPENAI_FALLBACK_MODELS in order
+    instead of letting the whole pipeline crash."""
+    models_to_try = [OPENAI_MODEL] + OPENAI_FALLBACK_MODELS
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            response = openai_client.responses.create(model=model_name, input=prompt)
+            return response.output_text
+        except (RateLimitError, APIStatusError) as e:
+            print(f"⚠️ {model_name} unavailable ({e}). Trying next fallback model...")
+            last_error = e
+            continue
+    raise last_error
+
+# Twitter Credentials
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
+X_API_KEY = os.getenv("X_API_KEY")
+X_API_SECRET = os.getenv("X_API_SECRET")
+X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
+X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
 
 # Your existing system voice rules
 SHARED_VOICE_AND_VERIFICATION = (
     "VOICE RULES: NEVER use hedges, preambles, or generic openers. "
     "ALWAYS lead with the insight, use short declarative sentences, and state settled facts as facts. "
-    "STRUCTURE: X posts under 280 chars unless a thread. Rewrite per room across platforms."
 )
+
 
 # =====================================================================
 # MODULE 1: ANALYTICS & FEEDBACK LOOP
 # =====================================================================
+import tweepy
+import datetime
+
+def get_current_week_target(plan_csv=Path(__file__).parent / "output" / "weekly_plan_vs_actual.csv"):
+    """This calendar week's planned targets from the plan CSV, so the storyboard
+    is held to a number. Returns None if the file is missing or the week is past
+    the planned horizon."""
+    try:
+        plan = pd.read_csv(plan_csv)
+    except FileNotFoundError:
+        return None
+    week_start = pd.Timestamp(datetime.date.today()).to_period("W-SAT").start_time  # Sunday
+    label = week_start.strftime("%-m/%-d/%Y")  # macOS/Linux; use %#m/%#d on Windows
+    row = plan.loc[plan["Week"] == label]
+    if row.empty or pd.isna(row.iloc[0].get("Impressions (Planned)")):
+        return None
+    r = row.iloc[0]
+    return {
+        "week": label,
+        "impressions": int(r["Impressions (Planned)"]),
+        "likes": int(r["Likes (Planned)"]) if pd.notna(r.get("Likes (Planned)")) else None,
+    }
+
 class AnalyticsEngine:
-    """Simulates or fetches recent X/Social performance metrics to create a feedback loop."""
+    """Connects to X API v2, fetches recent tweets, and computes actual
+    engagement statistics + structural features in Python (not in the prompt).
+    The LLM receives conclusions, not raw numbers, so it isn't asked to do
+    statistical inference in its head."""
+
+    FALLBACK = {
+        "live_data_active": False,
+        "summary": (
+            "Static baseline from CSV export through 2026-06-17 (38 posts): "
+            "typical organic post ~80 impressions; like rate 1.3%, reply and "
+            "repost rates ~0.1% per impression. All four outlier posts "
+            "(1.7K-46K impressions) were data-driven/contrarian takes, while "
+            "the organic floor is low-engagement — consistency, not volume, "
+            "is the current gap."
+        ),
+        "top_features": ["specific_number_in_first_sentence", "contrarian_opener"],
+        "avoid_features": ["generic_motivational_language"],
+    }
+
+    @staticmethod
+    def _extract_features(text: str) -> dict:
+        """Cheap, deterministic structural features computed in code."""
+        stripped = text.strip()
+        return {
+            "char_count": len(stripped),
+            "word_count": len(stripped.split()),
+            "opens_with_question": stripped.rstrip().endswith("?") is False and stripped.split("\n")[0].strip().endswith("?"),
+            "has_number": any(ch.isdigit() for ch in stripped[:60]),
+            "is_thread_like": "\n" in stripped or stripped.count(".") > 4,
+        }
+
     @staticmethod
     def get_recent_performance_data() -> dict:
-        # In production, replace this with actual tweepy / X API v2 payload data
-        print("📊 Extracting recent X content analytics...")
-        mock_analytics_data = {
-            "top_performing_hook_style": "Contrarian technical breakdown with real numbers",
-            "underperforming_style": "Generic high-level motivational or lifestyle posts",
-            "audience_resonance_topics": ["Workflow automation", "CPA to entrepreneur transition strategies"],
-            "average_engagement_rate_last_week": "4.8%"
-        }
-        return mock_analytics_data
+        print("📊 Extracting live analytics from your X account...")
+
+        if not X_BEARER_TOKEN or not X_API_KEY:
+            print("⚠️ X API keys missing or incomplete. Using fallback data.")
+            return AnalyticsEngine.FALLBACK
+
+        try:
+            client = tweepy.Client(
+                bearer_token=X_BEARER_TOKEN,
+                consumer_key=X_API_KEY,
+                consumer_secret=X_API_SECRET,
+                access_token=X_ACCESS_TOKEN,
+                access_token_secret=X_ACCESS_SECRET
+            )
+
+            me = client.get_me()
+            user_id = me.data.id
+            username = me.data.username
+            print(f"🔗 Authenticated successfully as @{username} (ID: {user_id})")
+
+            # Pull more history than before — 5 data points isn't enough to
+            # separate signal from noise. 30-50 gives quartiles something to work with.
+            tweets = client.get_users_tweets(
+                id=user_id,
+                max_results=50,
+                tweet_fields=["public_metrics", "text", "created_at"]
+            )
+
+            if not tweets.data:
+                print("⚠️ No tweets returned. Using fallback data.")
+                return AnalyticsEngine.FALLBACK
+
+            rows = []
+            for tweet in tweets.data:
+                m = tweet.public_metrics
+                impressions = m.get("impression_count", 0) or 1  # avoid div by zero
+                engagement = m.get("like_count", 0) + m.get("retweet_count", 0) + m.get("reply_count", 0)
+                rate = engagement / impressions
+                features = AnalyticsEngine._extract_features(tweet.text)
+                rows.append({
+                    "text": tweet.text,
+                    "engagement_rate": rate,
+                    "raw_engagement": engagement,
+                    "impressions": impressions,
+                    **features
+                })
+
+            # Rank by engagement rate, not raw counts (raw counts are biased
+            # toward whatever got the most impressions, not what resonated).
+            rows.sort(key=lambda r: r["engagement_rate"], reverse=True)
+            n = len(rows)
+            top_cut = max(1, n // 4)
+            top_quartile = rows[:top_cut]
+            bottom_quartile = rows[-top_cut:]
+
+            def summarize(group, label):
+                avg_words = statistics.mean(r["word_count"] for r in group)
+                pct_number = sum(r["has_number"] for r in group) / len(group) * 100
+                pct_question = sum(r["opens_with_question"] for r in group) / len(group) * 100
+                pct_thread = sum(r["is_thread_like"] for r in group) / len(group) * 100
+                return (
+                    f"{label} (n={len(group)}): avg {avg_words:.0f} words, "
+                    f"{pct_number:.0f}% include a concrete number early, "
+                    f"{pct_question:.0f}% open with a question, "
+                    f"{pct_thread:.0f}% are thread-like/multi-sentence."
+                )
+
+            top_summary = summarize(top_quartile, "TOP QUARTILE (by engagement rate)")
+            bottom_summary = summarize(bottom_quartile, "BOTTOM QUARTILE (by engagement rate)")
+
+            # Give the LLM 2-3 verbatim top examples as pattern references,
+            # not just stats — this is what actually transfers "what worked."
+            top_examples = [r["text"] for r in top_quartile[:3]]
+
+            return {
+                "live_data_active": True,
+                "sample_size": n,
+                "top_quartile_summary": top_summary,
+                "bottom_quartile_summary": bottom_summary,
+                "top_performing_examples": top_examples,
+                "summary": (
+                    f"{top_summary} {bottom_summary} "
+                    "Favor structural patterns from the top quartile; avoid patterns "
+                    "concentrated in the bottom quartile."
+                ),
+            }
+
+        except Exception as e:
+            print(f"❌ X API Error: {e}. Defaulting to strategic fallback configuration.")
+            fallback = dict(AnalyticsEngine.FALLBACK)
+            fallback["api_error_log"] = str(e)
+            return fallback
+
 
 # =====================================================================
 # MODULE 2: STRATEGY & STORYBOARD ENGINE
 # =====================================================================
 class StrategyEngine:
     """Establishes the macro strategy and cohesive storyboards across content pillars."""
+
+    # NOTE: Replace the empty voice_examples lists below with 3-5 of your own
+    # past posts that you consider genuinely on-voice. Adjectives like "direct"
+    # or "data-grounded" carry almost no signal to an LLM — verbatim examples
+    # of sentence rhythm and structure do. This is the single highest-leverage
+    # change you can make to output quality.
+    BRAND_CONFIG = {
+        "ozoemena_nnamadim": {
+            "display_name": "Ozoemena Nnamadim",
+            "voice": "personal, professional, direct, data-grounded, and skeptical of hype",
+            "voice_examples": [
+                # "Paste 3-5 of your own past posts here, verbatim, that you consider your best voice.",
+            ],
+            "pillars": [
+                "Learned Experiences from Founding a Startup",
+                "CPA Pipeline Content",
+                "Economic Policy Content",
+                "Application of Auditing Knowledge in Various Areas of Life",
+                "General Healthy, Black, LGBTQ, Professional Lifestyle Content",
+            ],
+            "formats": ["plain_text", "thread"],
+        },
+        "aperture_advisory": {
+            "display_name": "Aperture Advisory",
+            "voice": "focused on building brand awareness through consistent demonstrations of complex analysis and thought leadership in public accounting, economic policy, and technological innovation",
+            "voice_examples": [
+                # "Paste 3-5 of your own past posts here, verbatim, that you consider your best voice.",
+            ],
+            "pillars": [
+                "Application of Technology in Small Business",
+                "Technical Analysis of Trends in Financial Markets & Economic Policy",
+                "Process Improvement due to AI",
+            ],
+            "formats": ["aperture_card", "plain_text", "thread"],
+        },
+    }
+
+
+
     @staticmethod
-    def generate_weekly_storyboard(monthly_theme: str, active_pillar: str, performance_data: dict) -> str:
-        print(f"🎯 Creating a cohesive weekly storyboard for Pillar: {active_pillar}...")
-        
+    def _format_voice_examples(examples: list) -> str:
+        if not examples:
+            return "(No verbatim examples provided yet — relying on the voice description only, which is weaker. Add real past posts to BRAND_CONFIG for stronger voice matching.)"
+        numbered = "\n".join(f"{i+1}. {ex}" for i, ex in enumerate(examples))
+        return f"Match the rhythm, sentence length, and structure of these actual past posts:\n{numbered}"
+
+    @staticmethod
+    def generate_weekly_storyboard(brand_key: str, monthly_theme: str, active_pillar: str,
+                                   performance_data: dict, weekly_target: dict = None) -> str:
+        brand = StrategyEngine.BRAND_CONFIG[brand_key]
+        print(f"🎯 Creating a cohesive weekly storyboard for {brand['display_name']} — Pillar: {active_pillar}...")
+
+        voice_block = StrategyEngine._format_voice_examples(brand["voice_examples"])
+        perf_summary = performance_data.get("summary", str(performance_data))
+
+        target_block = ""
+        if weekly_target:
+            target_block = (
+                    f"WEEKLY TARGET (from plan-vs-actual tracker, week of {weekly_target['week']}): "
+                    f"~{weekly_target['impressions']} impressions"
+                    + (f", ~{weekly_target['likes']} likes" if weekly_target['likes'] else "")
+                    + ". Set cadence and format ambition consistent with reaching this target."
+            )
+
         prompt = f"""
-        Act as a Master Social Media Strategist. Define a cohesive 5-day story arc (throughline) for this week.
-        
-        MONTHLY THEME: {monthly_theme}
-        ACTIVE PILLAR: {active_pillar}
-        RECENT PERFORMANCE DATA TO ADAPT TO: {performance_data}
-        
-        OUTPUT FORMAT:
-        - WEEKLY THROUGHLINE: (One sentence narrative arc connecting all posts this week)
-        - DAY 1 (The Hook/Problem): Concept overview
-        - DAY 2 (The Data/Evidence): Deep-dive breakdown
-        - DAY 3 (The Solution/Framework): Practical execution
-        - DAY 4 (The Contrarian Take): Challenging the status quo
-        - DAY 5 (The Actionable Summary): High-impact wrap up and clear CTA
-        """
-        
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.4)
-        )
-        return response.text
+            You are the content strategist for {brand['display_name']}, a brand founded
+            and developed by a CPA focused on re-establishing credibility and
+            documenting hands-on Python/fintech experimentation. Both this brand and
+            its sibling brand correct popular narratives with real, factual data rather
+            than anecdotes or speculation.
+
+            BRAND VOICE (description): {brand['voice']}
+            BRAND VOICE (examples): {voice_block}
+            AVAILABLE FORMATS: {', '.join(brand['formats'])}
+            ALL PILLARS FOR THIS BRAND: {', '.join(brand['pillars'])}
+
+            MONTHLY THEME: {monthly_theme}
+            ACTIVE PILLAR (this week's focus): {active_pillar}
+            PERFORMANCE ANALYSIS (already computed, treat as ground truth): {perf_summary}
+            {target_block}
+
+            Define a cohesive 5-day story arc (throughline) for this week's content,
+            built around the active pillar above, using only the formats listed for
+            this brand.
+
+            Before drafting, briefly note how the performance analysis above should
+            shape format/angle choices this week — 1-2 sentences, in a
+            "performance_notes" field.
+
+            For each day, choose the narrative beat that best fits this week's topic —
+            don't force a beat (e.g., a contrarian take) if the topic has no genuine
+            tension to explore. If a beat doesn't fit, replace it with a stronger one
+            and say why in "beat_rationale".
+
+            Standard beats to draw from (use, skip, or reorder as the topic demands):
+            Hook/Problem, Data/Evidence, Solution/Framework, Contrarian Take,
+            Actionable Summary.
+
+            If a day's draft relies on a specific statistic, market figure, or claim
+            that isn't already provided in the performance data or theme inputs, flag
+            it explicitly in "needs_verification" rather than stating it as fact.
+
+            Return ONLY valid JSON in this exact structure, no prose outside the JSON:
+
+            {{
+              "brand": "{brand['display_name']}",
+              "active_pillar": "{active_pillar}",
+              "weekly_throughline": "one sentence connecting all 5 days",
+              "performance_notes": "1-2 sentences on how performance data shaped this plan",
+              "days": [
+                {{
+                  "day": 1,
+                  "beat": "name of narrative beat used",
+                  "beat_rationale": "why this beat fits (only if it deviates from standard)",
+                  "format": "one of the brand's available formats",
+                  "concept": "2-3 sentence description of the post's content",
+                  "needs_verification": ["any claims requiring a source check, or empty list"]
+                }}
+              ]
+            }}
+            """
+        return openai_generate_with_fallback(prompt)
+
 
 # =====================================================================
 # MODULE 3: TRANSFERABLE RESEARCH ENGINE
 # =====================================================================
 class ResearchEngine:
     """Generates clean, transferable research inputs mapping directly to the narrative arc."""
+
     @staticmethod
     def generate_research_brief(topic: str, weekly_storyboard: str) -> str:
         print("📚 Executing deep research briefing via Claude...")
-        
+
         prompt = f"""
         You are a specialized content researcher. Prepare a highly transferable research briefing on: {topic}
         It must seamlessly feed into this planned weekly narrative arc:
@@ -98,30 +376,35 @@ class ResearchEngine:
         4. Risks, Pitfalls, & Hidden Realities
         5. The Strategic Counterpoint (What everyone gets wrong about this topic)
         """
-        
+
         message = claude_client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=3000,
-            temperature=0.3,
+            max_tokens=4000,
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text
+
 
 # =====================================================================
 # MODULE 4: COLLABORATIVE PRODUCTION & EDITING ENGINE
 # =====================================================================
 class ProductionEngine:
     """Manages multi-LLM copywriting, image prompting, and collaborative editing."""
+
     @staticmethod
-    def generate_initial_draft(research_brief: str, storyboard: str) -> str:
-        print("🤖 Crafting initial content drafts (Gemini)...")
+    def generate_initial_draft(research_brief: str, storyboard: str, voice_examples: list) -> str:
+        print("🤖 Crafting initial content drafts (OpenAI)...")
+        voice_block = StrategyEngine._format_voice_examples(voice_examples)
         prompt = f"""
         Using this STORYBOARD:
         {storyboard}
-        
+
         And this RESEARCH BRIEF:
         {research_brief}
-        
+
+        VOICE EXAMPLES TO MATCH: {voice_block}
+
         Generate a complete 5-day social media plan. Follow this exact template for EACH day:
         ---
         [DAY]:
@@ -130,21 +413,19 @@ class ProductionEngine:
         ---
         Apply these rules: {SHARED_VOICE_AND_VERIFICATION}
         """
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.5)
-        )
-        return response.text
+        return openai_generate_with_fallback(prompt)
 
     @staticmethod
-    def collaborative_edit_loop(initial_draft: str) -> str:
-        print("🪶 Running editor loop (Claude Reviewing Gemini Draft)...")
-        
+    def collaborative_edit_loop(initial_draft: str, voice_examples: list) -> str:
+        print("🪶 Running editor loop (Claude Reviewing OpenAI Draft)...")
+        voice_block = StrategyEngine._format_voice_examples(voice_examples)
+
         editing_prompt = f"""
-        Review and ruthlessly polish the following initial social media draft. 
+        Review and ruthlessly polish the following initial social media draft.
         You must enforce these constraints flawlessly:
         {SHARED_VOICE_AND_VERIFICATION}
+
+        VOICE EXAMPLES TO MATCH (rhythm, sentence length, structure): {voice_block}
 
         INITIAL DRAFT:
         {initial_draft}
@@ -153,57 +434,167 @@ class ProductionEngine:
         """
         message = claude_client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=4096,
-            temperature=0.2,
+            max_tokens=5500,
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": editing_prompt}],
         )
         return message.content[0].text
 
     @staticmethod
-    def generate_graphic_prompts(final_copy: str) -> str:
+    def self_critique_pass(edited_copy: str, voice_examples: list) -> dict:
+        """Extra revision pass: score the edited copy against explicit criteria
+        and revise anything that fails. Returns structured JSON so the clean,
+        publishable copy is never mixed with scorecards or verification notes —
+        those get surfaced separately instead of getting baked into the text
+        that downstream steps (or you, when posting) would otherwise use as-is.
+        """
+        print("🔎 Running self-critique / revision pass (Claude)...")
+        voice_block = StrategyEngine._format_voice_examples(voice_examples)
+
+        critique_prompt = f"""
+        Score the following finalized social media copy against these criteria,
+        one entry per day, PASS or FAIL with a one-sentence reason:
+        1. Sounds like the voice examples below (rhythm, sentence length), not generic AI copy.
+        2. Leads with the insight in the first sentence — no preamble or hedge.
+        3. Every factual claim is either grounded in the research brief or flagged as needing verification.
+        4. Fits the platform's hard character limit.
+
+        VOICE EXAMPLES: {voice_block}
+
+        COPY TO SCORE:
+        {edited_copy}
+
+        For any day that fails a criterion, revise it. IMPORTANT: the revised
+        copy must be publish-ready as-is — do NOT embed verification notes,
+        parentheticals, or asterisked caveats inside the copy text itself.
+        If a claim can't be grounded, either remove/soften it into an opinion
+        statement, or replace it with a claim you ARE confident is accurate
+        framing (not a specific stat) — then separately list what needs a
+        source check in "flagged_claims", NOT inside the copy.
+
+        Return ONLY valid JSON, no prose outside the JSON, in this exact structure:
+        {{
+          "days": [
+            {{
+              "day": 1,
+              "clean_copy": "the final publish-ready copy for this day, no caveats or notes embedded",
+              "scorecard": {{"voice": "PASS/FAIL", "leads_with_insight": "PASS/FAIL", "claims_grounded": "PASS/FAIL", "char_limit": "PASS/FAIL"}},
+              "flagged_claims": ["any claim that still needs a source check before publishing, or empty list"]
+            }}
+          ],
+          "outstanding_notes": "anything the user should address before the next batch (e.g. missing voice examples)"
+        }}
+        """
+        message = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=5500,
+            thinking={"type": "disabled"},
+            messages=[{"role": "user", "content": critique_prompt}],
+        )
+        raw_text = message.content[0].text.strip()
+        # Defensive: strip accidental markdown fences if the model adds them
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
+        return json.loads(raw_text)
+
+    @staticmethod
+    def generate_graphic_prompts(clean_copy_by_day: str) -> str:
         print("🎨 Generating asset visual direction and graphic design prompts...")
         prompt = f"""
         Based on the following approved social copy, generate text-to-image prompts or text-overlay templates for standard graphic design software (Midjourney/Canva/DALL-E).
         Provide a visual prompt/direction for each day that matches a clean, premium brand aesthetic for Black professionals and creatives.
 
         APPROVED COPY:
-        {final_copy}
+        {clean_copy_by_day}
         """
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.4)
-        )
-        return response.text
+        return openai_generate_with_fallback(prompt)
+
 
 # =====================================================================
-# EXECUTION WORKFLOW
+# EXECUTION WORKFLOW — FULL CONTENT CALENDAR (ALL PILLARS PER BRAND)
 # =====================================================================
 if __name__ == "__main__":
-    # High-level Strategic Anchors
-    MONTHLY_THEME = "Scaling Digital Asset Operations for Micro-Consultancies"
-    TARGET_PILLAR = "Integrating Technology into Workflows"
-    
-    print(f"🚀 STARTING ENTERPRISE WORKFLOW FOR: '{MONTHLY_THEME}'")
-    
-    # 1. Analytics & Feedback Loop
+    # Each brand gets its own monthly theme, since they're different audiences
+    # with different goals rather than one shared narrative.
+    MONTHLY_THEMES = {
+        "ozoemena_nnamadim": "Rebuilding and Career Pivots",
+        "aperture_advisory": "Technology Integration for Small and Medium Enterprises",
+    }
+
+    print("🚀 STARTING ENTERPRISE WORKFLOW — FULL CONTENT CALENDAR (ALL PILLARS)")
+
+    # 1. Analytics & Feedback Loop (shared across both brands, computed once
+    #    per run rather than once per pillar — the account's performance
+    #    history doesn't change between pillars in the same run).
     analytics = AnalyticsEngine.get_recent_performance_data()
-    
-    # 2. Strategy & Storyboard Development
-    weekly_storyboard = StrategyEngine.generate_weekly_storyboard(MONTHLY_THEME, TARGET_PILLAR, analytics)
-    print("\n🗺️ WEEKLY STORYBOARD MAP:\n", weekly_storyboard)
-    
-    # 3. Transferable Research Collection
-    research_brief = ResearchEngine.generate_research_brief(TARGET_PILLAR, weekly_storyboard)
-    
-    # 4. Content Production & Multi-LLM Review Loop
-    raw_draft = ProductionEngine.generate_initial_draft(research_brief, weekly_storyboard)
-    final_edited_copy = ProductionEngine.collaborative_edit_loop(raw_draft)
-    
-    print("\n✨ FINAL COPY FOR YOUR APPROVAL:\n", final_edited_copy)
-    
-    # 5. Asset Prompt Production (Graphic/Image Engine)
-    design_brief = ProductionEngine.generate_graphic_prompts(final_edited_copy)
-    print("\n🎨 COMPANION VISUAL DESIGN PROMPTS:\n", design_brief)
-    
-    print("\n🎬 Production pipeline complete. Ready for manual staging and filming.")
+    weekly_target = get_current_week_target()
+
+    # 2. Outer loop: each brand
+    for brand_key, brand_cfg in StrategyEngine.BRAND_CONFIG.items():
+        monthly_theme = MONTHLY_THEMES[brand_key]
+        print(f"\n{'='*70}\n BRAND: {brand_key}  |  THEME: {monthly_theme}\n{'='*70}")
+
+        # 3. Inner loop: every pillar for this brand gets its own full 5-day
+        #    storyboard, instead of picking a single ACTIVE_PILLAR — this is
+        #    what turns the run into a complete weekly content calendar
+        #    (serious/technical + lifestyle + all other pillars together).
+        for pillar_idx, pillar in enumerate(brand_cfg["pillars"], start=1):
+            print(f"\n{'-'*70}\n PILLAR {pillar_idx}/{len(brand_cfg['pillars'])}: {pillar}\n{'-'*70}")
+
+            # Strategy & Storyboard Development
+            weekly_storyboard = StrategyEngine.generate_weekly_storyboard(
+                brand_key, monthly_theme, pillar, analytics, weekly_target
+            )
+            print(f"\n🗺️ WEEKLY STORYBOARD MAP ({brand_key} / {pillar}):\n", weekly_storyboard)
+
+            # Transferable Research Collection
+            research_brief = ResearchEngine.generate_research_brief(pillar, weekly_storyboard)
+
+            # Content Production & Multi-LLM Review Loop (voice-example aware)
+            raw_draft = ProductionEngine.generate_initial_draft(
+                research_brief, weekly_storyboard, brand_cfg["voice_examples"]
+            )
+            edited_copy = ProductionEngine.collaborative_edit_loop(
+                raw_draft, brand_cfg["voice_examples"]
+            )
+            critique_result = ProductionEngine.self_critique_pass(
+                edited_copy, brand_cfg["voice_examples"]
+            )
+
+            # Build the clean, publish-ready copy (no scorecards or verification
+            # notes embedded) — this is the only version that gets used downstream
+            # or that you should copy/paste into a scheduler.
+            clean_copy_lines = []
+            flags_found = False
+            for day in critique_result["days"]:
+                clean_copy_lines.append(f"--- Day {day['day']} ---\n{day['clean_copy']}\n")
+                if day.get("flagged_claims"):
+                    flags_found = True
+            clean_copy_text = "\n".join(clean_copy_lines)
+
+            print(f"\n✨ FINAL COPY FOR YOUR APPROVAL ({brand_key} / {pillar}) — publish-ready:\n{clean_copy_text}")
+
+            # Surface anything needing a source check separately, instead of
+            # burying it inside the copy itself.
+            if flags_found:
+                print(f"\n⚠️ CLAIMS FLAGGED FOR VERIFICATION ({brand_key} / {pillar}) — confirm before posting:")
+                for day in critique_result["days"]:
+                    if day.get("flagged_claims"):
+                        print(f"  Day {day['day']}: {day['flagged_claims']}")
+            if critique_result.get("outstanding_notes"):
+                print(f"\n📝 Outstanding notes ({brand_key} / {pillar}): {critique_result['outstanding_notes']}")
+
+            # Asset Prompt Production (Graphic/Image Engine)
+            design_brief = ProductionEngine.generate_graphic_prompts(clean_copy_text)
+            print(f"\n🎨 COMPANION VISUAL DESIGN PROMPTS ({brand_key} / {pillar}):\n", design_brief)
+
+    print(f"\n{'='*70}")
+    print("🎬 FULL CONTENT CALENDAR COMPLETE FOR ALL BRANDS & PILLARS")
+    print(f"{'='*70}")
+    for brand_key, brand_cfg in StrategyEngine.BRAND_CONFIG.items():
+        n_pillars = len(brand_cfg["pillars"])
+        print(f"  • {brand_cfg['display_name']}: {n_pillars} pillars × 5 days = {n_pillars * 5} posts")
+    print("\nReady for manual staging, fact-checking, and scheduling.")
